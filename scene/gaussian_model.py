@@ -11,39 +11,82 @@
 
 import torch
 import numpy as np
-from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
+from gaussian_splatting.utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
 from torch import nn
 import os
-from utils.system_utils import mkdir_p
+from gaussian_splatting.utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
-from utils.sh_utils import RGB2SH
+from gaussian_splatting.utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
-from utils.graphics_utils import BasicPointCloud
-from utils.general_utils import strip_symmetric, build_scaling_rotation
+from gaussian_splatting.utils.graphics_utils import BasicPointCloud
+from gaussian_splatting.utils.general_utils import strip_symmetric, build_scaling_rotation
+from tqdm import tqdm
+from torch.nn import functional as F
 
-class GaussianModel:
+class ColorFieldModule(nn.Module):
+    '''
+    Color Field module that takes a bunch of coordinates and returns SH coefficients  (only supports degree 0)
+    '''
+    def __init__(self, cfg) -> None:
+        super().__init__()
+        # init frequencies
+        freq = np.pi * 2.0**torch.linspace(0, cfg.max_freq, cfg.num_freq)[None]  # 2^i pi
+        self.register_buffer('freq', freq)
+        # mlp
+        mlp = []
+        layer_inds = [cfg.num_freq * 6] + cfg.hidden_layers + [3]
+        for i in range(len(layer_inds) - 1):
+            mlp.append(nn.Linear(layer_inds[i], layer_inds[i+1]))
+            mlp.append(nn.LeakyReLU(0.01, inplace=True))
+        mlp = mlp[:-1]
+        self.mlp = nn.Sequential(*mlp)
+    
+    def forward(self, x):
+        ''' x: [B, 3] coordinates '''
+        freq_enc = []
+        for i in range(3):
+            omega = x[:, i:i+1] * self.freq
+            freq_enc.append(torch.sin(omega))
+            freq_enc.append(torch.cos(omega))
+        freq_enc = torch.cat(freq_enc, dim=1)  # [B, freq]
+        sh = self.mlp(freq_enc)  # [B, 3]
+        return sh.unsqueeze(1)   # [B, 1, 3]
 
+class SMPLGaussianModel:
+    '''
+    Gaussian model, where locations are replaced with the barycentric coordinates of the mesh 
+
+    Here, the `xyz` parameter is the barycentric coordinates of the mesh, 
+    and we have an extra *non-optimizable* parameter `face_idx` that keeps the face indices on the mesh
+
+    `face_aligned` is a variable that tells us whether to constrain the splats 
+    to the surface of the face. If not, then the rotation of the covariance matrix needs to be figured out
+
+    '''
     def setup_functions(self):
-        def build_covariance_from_scaling_rotation(scaling, scaling_modifier, rotation):
+        def build_covariance_from_scaling_rotation(scaling, scaling_modifier, rotation, extra_rotation_matrix = None):
             L = build_scaling_rotation(scaling_modifier * scaling, rotation)
             actual_covariance = L @ L.transpose(1, 2)
+            # this rotation matrix can also be a rigid matrix (M)
+            if extra_rotation_matrix is not None:  # [N, 3, 3]
+                actual_covariance = extra_rotation_matrix @ actual_covariance @ extra_rotation_matrix.transpose(1, 2)
             symm = strip_symmetric(actual_covariance)
             return symm
-        
+        # set the activation functions
         self.scaling_activation = torch.exp
         self.scaling_inverse_activation = torch.log
-
         self.covariance_activation = build_covariance_from_scaling_rotation
-
         self.opacity_activation = torch.sigmoid
         self.inverse_opacity_activation = inverse_sigmoid
-
         self.rotation_activation = torch.nn.functional.normalize
 
-
-    def __init__(self, sh_degree : int):
+    def __init__(self, cfg, sh_degree : int, num_points_init: int = 50000):
+        self.cfg = cfg
+        # here cfg is the master cfg
         self.active_sh_degree = 0
         self.max_sh_degree = sh_degree  
+        self.num_points_init = num_points_init
+        self._faces = torch.empty(0)
         self._xyz = torch.empty(0)
         self._features_dc = torch.empty(0)
         self._features_rest = torch.empty(0)
@@ -57,11 +100,22 @@ class GaussianModel:
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self.setup_functions()
+        self.setup_colorfield(cfg)
+    
+    def setup_colorfield(self, cfg):
+        cf = cfg.network.colorfield
+        self.cf_enabled = cf.enable
+        if cf.enable == True:
+            self.colorfield = ColorFieldModule(cf)
+        else:
+            self.colorfield = nn.Linear(1, 1) ## dummy
+        self.colorfield = self.colorfield.cuda()
 
     def capture(self):
         return (
             self.active_sh_degree,
             self._xyz,
+            self._faces,
             self._features_dc,
             self._features_rest,
             self._scaling,
@@ -70,13 +124,15 @@ class GaussianModel:
             self.max_radii2D,
             self.xyz_gradient_accum,
             self.denom,
-            self.optimizer.state_dict(),
+            self.colorfield.state_dict(),
+            self.optimizer.state_dict() if self.optimizer is not None else None,
             self.spatial_lr_scale,
         )
     
     def restore(self, model_args, training_args):
         (self.active_sh_degree, 
         self._xyz, 
+        self._faces,
         self._features_dc, 
         self._features_rest,
         self._scaling, 
@@ -85,12 +141,15 @@ class GaussianModel:
         self.max_radii2D, 
         xyz_gradient_accum, 
         denom,
+        colorfield_dict,
         opt_dict, 
         self.spatial_lr_scale) = model_args
+        # set up training and gradient accumulation
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
         self.optimizer.load_state_dict(opt_dict)
+        self.colorfield.load_state_dict(colorfield_dict)
 
     @property
     def get_scaling(self):
@@ -105,48 +164,104 @@ class GaussianModel:
         return self._xyz
     
     @property
+    def get_features_dc(self):
+        # get sh coefficients from colorfield
+        if self.cf_enabled:
+            return self.colorfield(self._xyz)
+        else:
+            return self._features_dc
+    
+    @get_features_dc.setter
+    def get_features_dc(self, values):
+        self.cf_enabled = False
+        self._features_dc = values
+    
+    @property
     def get_features(self):
-        features_dc = self._features_dc
-        features_rest = self._features_rest
+        # features_dc = [F, 1, 3]
+        # features_rest = [F, N, 3]
+        deg = self.active_sh_degree
+        features_dc = self.get_features_dc
+        if deg == 0:
+            features_rest = torch.zeros_like(self._features_rest)
+        else:
+            # select only upto `degree` coefficients  (remove the dc component)
+            tot_coeff = (deg + 1) ** 2  - 1
+            features_active = self._features_rest[:, :tot_coeff, :]
+            features_zero = torch.zeros_like(self._features_rest[:, tot_coeff:, :])
+            features_rest = torch.cat([features_active, features_zero], dim=1)
         return torch.cat((features_dc, features_rest), dim=1)
     
     @property
     def get_opacity(self):
         return self.opacity_activation(self._opacity)
     
-    def get_covariance(self, scaling_modifier = 1):
-        return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
+    def get_covariance(self, scaling_modifier = 1, extra_rotation_matrix = None):
+        return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation, extra_rotation_matrix)
 
     def oneupSHdegree(self):
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
 
-    def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float):
+    def create_from_SMPL(self, smpl_mesh, faces, per_face_color: torch.Tensor, spatial_lr_scale: float):
+        ''' given smpl mesh and face color list, initialize the model 
+
+        :smpl_mesh: Collection of vertices in canonical pose. Barycentric coordinates are initialized to 
+            [0, 0, 0] and radius is equal to unsigned face area
+        :per_face_color: RGB color of each face [Nf, 3]
+        '''
+        N = per_face_color.shape[0]
         self.spatial_lr_scale = spatial_lr_scale
-        fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
-        fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
-        features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
-        features[:, :3, 0 ] = fused_color
-        features[:, 3:, 1:] = 0.0
 
-        print("Number of points at initialisation : ", fused_point_cloud.shape[0])
-
-        dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
-        scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
-        rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
+        # set scales
+        smpl_template = smpl_mesh.detach()  # [Nv, 3]
+        f1, f2, f3 = faces.t()  # Nf each
+        v1, v2, v3 = smpl_template[f1], smpl_template[f2], smpl_template[f3]  # [Nf, 3]
+        device = v1.device
+        facearea = torch.norm(torch.cross(v2 - v1, v3 - v1), dim=-1) / 2  # [Nf]   
+        # select faces
+        # in the free point version, we dont need to keep track of which face this came from
+        self._faces = torch.multinomial(facearea*0 + 1, self.num_points_init, replacement=True).long()  # [N_init]
+        ## starting the scales with a much smaller value
+        scales = torch.log(facearea[self._faces, None].repeat(1, 3) + 1e-10)/2 - np.log(3)
+        print("Scales", scales.min(), scales.max())
+        # scales = torch.log(facearea[self._faces, None].repeat(1, 3) + 1e-10)*0 - 5
+        rots = torch.zeros((self.num_points_init, 4), device="cuda")
         rots[:, 0] = 1
+        opacities = inverse_sigmoid(0.5 * torch.ones((self.num_points_init, 1), dtype=torch.float, device="cuda"))
+        
+        # Set color
+        fused_color = RGB2SH(per_face_color[self._faces, :].float().cuda())
+        features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
+        features[:, :3, 0] = fused_color
 
-        opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+        # sample points from the facearea
+        if self.cfg.splat_options.face_aligned_init:
+            print("Initializing points on the faces...")
+            v1s, v2s, v3s = smpl_template[f1[self._faces]], smpl_template[f2[self._faces]], smpl_template[f3[self._faces]]  # [Np, 3]
+            w = torch.rand((self.num_points_init, 1, 3), device=device)
+            w /= w.sum(dim=-1, keepdim=True)  # [N, 1]
+            xyz = (v1s * w[..., 0] + v2s * w[..., 1] + v3s * w[..., 2])  # [Np, 3]
+        else:
+            print("Initializing points randomly...")
+            mincoord, maxcoord = smpl_template.min(0).values[None], smpl_template.max(0).values[None]  # [1, 3], [1, 3]
+            u = torch.rand((self.num_points_init, 3), device=device)
+            xyz = u * (maxcoord - mincoord) + mincoord  # [Np, 3]
 
-        self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
-        self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
+        # set parameters
+        self._xyz = nn.Parameter(xyz.clone().requires_grad_(True))
+        self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))  # [Np, 1, 3]
         self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        # pretrain colorfield
+        self.pretrain_colorfield()
+
 
     def training_setup(self, training_args):
+        ''' here, training_args is the subconfig for the splats '''
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -154,17 +269,38 @@ class GaussianModel:
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
             {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
-            {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0, "name": "f_rest"},
+            {'params': [self._features_rest], 'lr': training_args.feature_lr / training_args.sh_features_lr_scale, "name": "f_rest"},
             {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
-            {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
+            {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
+            {'params': self.colorfield.parameters(), 'lr': self.cfg.network.colorfield.lr, "name": "colorfield", "weight_decay": 1e-5}
         ]
-
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
+        # self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-8)
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
                                                     lr_final=training_args.position_lr_final*self.spatial_lr_scale,
+                                                    lr_delay_steps=training_args.position_lr_delay_steps,
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
                                                     max_steps=training_args.position_lr_max_steps)
+    
+    def pretrain_colorfield(self):
+        ''' pretrain the colorfield using parameters obtained from SMPL init '''
+        if not self.cf_enabled:
+            print("No colorfield initialized, skipping pretraining.")
+            return
+        print("Pretraining color field using network parameters...")
+        max_epochs = self.cfg.network.colorfield.pretrain_epochs
+        pbar = tqdm(range(max_epochs))
+        optim = torch.optim.Adam(self.colorfield.parameters(), lr=3e-4, weight_decay=1e-5)
+        for i in pbar:
+            optim.zero_grad()
+            dc = self.get_features_dc
+            gt_dc = self._features_dc.detach()
+            loss = F.mse_loss(dc, gt_dc)
+            pbar.set_description("Epoch: {}/{}, Loss: {}".format(i, max_epochs, loss.item()))
+            loss.backward()
+            optim.step()
+        print("Finished pretraining...")
 
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''
@@ -189,6 +325,7 @@ class GaussianModel:
         return l
 
     def save_ply(self, path):
+        raise NotImplementedError
         mkdir_p(os.path.dirname(path))
 
         xyz = self._xyz.detach().cpu().numpy()
@@ -213,6 +350,7 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
 
     def load_ply(self, path):
+        raise NotImplementedError
         plydata = PlyData.read(path)
 
         xyz = np.stack((np.asarray(plydata.elements[0]["x"]),
@@ -273,6 +411,9 @@ class GaussianModel:
     def _prune_optimizer(self, mask):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
+            # dont need to prune anything in the colorfield
+            if group['name'] == 'colorfield':
+                continue
             stored_state = self.optimizer.state.get(group['params'][0], None)
             if stored_state is not None:
                 stored_state["exp_avg"] = stored_state["exp_avg"][mask]
@@ -300,33 +441,33 @@ class GaussianModel:
         self._rotation = optimizable_tensors["rotation"]
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
-
         self.denom = self.denom[valid_points_mask]
+        self._faces = self._faces[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
+            # dont need to concat anything to colorfield
+            if group['name'] == 'colorfield':
+                continue
             assert len(group["params"]) == 1
             extension_tensor = tensors_dict[group["name"]]
             stored_state = self.optimizer.state.get(group['params'][0], None)
             if stored_state is not None:
-
                 stored_state["exp_avg"] = torch.cat((stored_state["exp_avg"], torch.zeros_like(extension_tensor)), dim=0)
                 stored_state["exp_avg_sq"] = torch.cat((stored_state["exp_avg_sq"], torch.zeros_like(extension_tensor)), dim=0)
-
                 del self.optimizer.state[group['params'][0]]
                 group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True))
                 self.optimizer.state[group['params'][0]] = stored_state
-
                 optimizable_tensors[group["name"]] = group["params"][0]
             else:
                 group["params"][0] = nn.Parameter(torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True))
                 optimizable_tensors[group["name"]] = group["params"][0]
-
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation,
+                              new_faces):
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
@@ -342,11 +483,15 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
 
+        self._faces = torch.cat((self._faces, new_faces), dim=0)
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
+        ''' select points, repeat the selected points, and add them to the list
+        for faces, we simply concat their index
+        '''
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device="cuda")
@@ -355,9 +500,10 @@ class GaussianModel:
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
 
-        stds = self.get_scaling[selected_pts_mask].repeat(N,1)
-        means =torch.zeros((stds.size(0), 3),device="cuda")
+        stds = self.get_scaling[selected_pts_mask].repeat(N, 1)
+        means = torch.zeros((stds.size(0), 3),device="cuda")
         samples = torch.normal(mean=means, std=stds)
+        # new_xyz = self.get_xyz[selected_pts_mask].repeat(N, 1) + samples
         rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N,1,1)
         new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
         new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N,1) / (0.8*N))
@@ -365,9 +511,11 @@ class GaussianModel:
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
+        # new faces
+        new_faces = self._faces[selected_pts_mask].repeat(N)
+        # self._faces = torch.cat((self._faces, new_faces), dim=0)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)
-
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_faces)
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
 
@@ -383,8 +531,9 @@ class GaussianModel:
         new_opacities = self._opacity[selected_pts_mask]
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
+        new_faces = self._faces[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_faces)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
         grads = self.xyz_gradient_accum / self.denom
@@ -399,9 +548,10 @@ class GaussianModel:
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
         self.prune_points(prune_mask)
-
         torch.cuda.empty_cache()
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
+
+## Base Gaussian is deleted and moved to `gaussian_model_base.py`
